@@ -106,7 +106,7 @@ jobs:
           toolchain: ${{ steps.tc.outputs.version }}
           components: clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: win-clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -218,12 +218,12 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
           Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link'
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: win-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@${{ inputs.nextest-version }}
 
@@ -316,7 +316,7 @@ jobs:
             "$($prop.Name)=$($prop.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@${{ inputs.nextest-version }}
 
@@ -381,7 +381,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           toolchain: ${{ steps.tc.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: win-release
           save-if: ${{ github.ref == 'refs/heads/main' }}

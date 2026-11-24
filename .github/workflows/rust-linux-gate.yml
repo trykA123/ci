@@ -80,7 +80,7 @@ jobs:
             libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev \
             libasound2-dev libzstd-dev
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ${{ inputs.cache-key }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -102,7 +102,7 @@ jobs:
           if [ "$USE_XTASK" = "true" ] || [ -f taplo.toml ]; then tools+=("taplo@0.10.0"); fi
           IFS=,; echo "list=${tools[*]}" >> "$GITHUB_OUTPUT"
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: ${{ steps.tools.outputs.list }}
 
