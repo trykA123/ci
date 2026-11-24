@@ -1,0 +1,347 @@
+# Reusable Windows release pipeline: tag/main guard, optional gate, auditable build, attestation, publish and retention.
+name: rust-windows-release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag vX.Y.Z[-pre] (empty reads workspace version from Cargo.toml)"
+        required: false
+        type: string
+        default: ""
+      package:
+        description: "Cargo package name of the app binary (e.g. lazysheet-app, sidewise-app)"
+        required: true
+        type: string
+      binary-name:
+        description: "Built executable filename in target/release/ (e.g. lazysheet-app.exe)"
+        required: true
+        type: string
+      asset-prefix:
+        description: "Prefix for staged portable executable and PDB zip (e.g. lazysheet)"
+        required: true
+        type: string
+      release-title-prefix:
+        description: "Title prefix for GitHub release (empty uses the tag alone)"
+        required: false
+        type: string
+        default: ""
+      toolchain:
+        description: "Rust toolchain version (empty reads rust-toolchain.toml or defaults to 1.99.0)"
+        required: false
+        type: string
+        default: ""
+      require-green-workflow:
+        description: "Workflow filename that must be green on HEAD unless full-checks is true (e.g. windows-quick.yml)"
+        required: false
+        type: string
+        default: ""
+      full-checks:
+        description: "Run Windows clippy, deny (if deny.toml), nextest and doc-tests before publishing"
+        required: false
+        type: boolean
+        default: false
+      dry-run:
+        description: "Build, verify and attest without publishing a GitHub release"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        required: false
+        type: boolean
+        default: true
+      keep-releases:
+        description: "Number of newest matching releases to keep (0 disables pruning)"
+        required: false
+        type: number
+        default: 5
+      notes-dir:
+        description: "Optional folder containing <version>.md release notes (e.g. release-notes)"
+        required: false
+        type: string
+        default: ""
+      use-lld:
+        description: "Use toolchain-bundled rust-lld as lld-link in gate-windows (matches rust-windows-check cache key)"
+        required: false
+        type: boolean
+        default: true
+      environment:
+        description: "GitHub Actions deployment environment protecting publish"
+        required: false
+        type: string
+        default: "release"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Releases run from main only
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          [ "$REF" = "refs/heads/main" ] || { echo "releases run from main only (ref: $REF)"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve and validate tag, notes and unused release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          NOTES_DIR: ${{ inputs.notes-dir }}
+        run: |
+          set -euo pipefail
+          cargo_ver=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$cargo_ver" ] || { echo "could not read version from Cargo.toml"; exit 1; }
+          tag="${INPUT_TAG:-v$cargo_ver}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad tag: $tag"; exit 1; }
+          ver="${tag#v}"
+          [ "$ver" = "$cargo_ver" ] || { echo "tag $tag does not match Cargo.toml version $cargo_ver"; exit 1; }
+          if [ -n "$NOTES_DIR" ] && [ ! -f "$NOTES_DIR/$ver.md" ]; then
+            echo "missing $NOTES_DIR/$ver.md"; exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag exists"; exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$ver"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify green CI run on HEAD unless full-checks is enabled
+        if: inputs.require-green-workflow != '' && !inputs.full-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ inputs.require-green-workflow }}
+        run: |
+          set -euo pipefail
+          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" --jq '.total_count')
+          [ "${n:-0}" -gt 0 ] || { echo "no green $WORKFLOW run for $GITHUB_SHA; pass full-checks=true or run it first"; exit 1; }
+
+  gate-windows:
+    needs: check-tag
+    if: inputs.full-checks
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve Rust toolchain version
+        id: tc
+        shell: bash
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+          components: clippy
+      - name: Enable bundled rust-lld as lld-link
+        if: inputs.use-lld
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sysroot = (rustc --print sysroot).Trim()
+          $rustLld = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'rust-lld-bin'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item -LiteralPath $rustLld -Destination (Join-Path $dir 'lld-link.exe') -Force
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: win-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest@0.9.148,cargo-deny@0.20.2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run cargo-deny when deny.toml exists
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'deny.toml') {
+            cargo deny check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Run tests
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath '.config/nextest.toml') {
+            cargo nextest run --workspace --profile ci
+          } else {
+            cargo nextest run --workspace --no-fail-fast
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --doc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build-windows:
+    needs: check-tag
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+      VERSION: ${{ needs.check-tag.outputs.version }}
+      PKG: ${{ inputs.package }}
+      BIN_NAME: ${{ inputs.binary-name }}
+      ASSET_PREFIX: ${{ inputs.asset-prefix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve Rust toolchain version
+        id: tc
+        shell: bash
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: win-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-auditable@0.7.7,cargo-audit@0.22.2
+      - name: Build auditable release binary
+        shell: pwsh
+        run: |
+          cargo auditable build --locked --release -p $env:PKG
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Audit the shipped executable
+        shell: pwsh
+        run: |
+          cargo audit bin "target/release/$env:BIN_NAME"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage portable binary, symbols and checksums
+        id: stage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $portable = "$env:ASSET_PREFIX-$env:VERSION-portable.exe"
+          Copy-Item -LiteralPath "target/release/$env:BIN_NAME" -Destination "out/$portable"
+          $assets = [Collections.Generic.List[string]]::new()
+          $assets.Add($portable)
+          $pdbStem = ([IO.Path]::GetFileNameWithoutExtension($env:BIN_NAME)) -replace '-', '_'
+          $pdbPath = "target/release/$pdbStem.pdb"
+          if (Test-Path -LiteralPath $pdbPath) {
+            $pdbZip = "$env:ASSET_PREFIX-windows-x64-pdb.zip"
+            Compress-Archive -LiteralPath $pdbPath -DestinationPath "out/$pdbZip"
+            $assets.Add($pdbZip)
+          }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'out/assets.txt'), (($assets -join "`n") + "`n"))
+          $lines = foreach ($name in $assets) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path 'out' $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'out/SHA256SUMS.txt'), (($lines -join "`n") + "`n"))
+          $paths = $assets | ForEach-Object { "out/$_" }
+          "paths<<EOF`n$($paths -join "`n")`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.stage.outputs.paths }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows-x64-${{ github.sha }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [check-tag, gate-windows, build-windows]
+    environment: ${{ inputs.environment }}
+    if: >-
+      always() && needs.build-windows.result == 'success'
+      && contains(fromJSON('["success","skipped"]'), needs.gate-windows.result)
+      && !inputs.dry-run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check-tag.outputs.tag }}
+      VERSION: ${{ needs.check-tag.outputs.version }}
+      TITLE_PREFIX: ${{ inputs.release-title-prefix }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      KEEP_RELEASES: ${{ inputs.keep-releases }}
+      NOTES_DIR: ${{ inputs.notes-dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.notes-dir != ''
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-windows-x64-${{ github.sha }}
+          path: out
+      - name: Verify checksums
+        working-directory: out
+        run: sha256sum -c SHA256SUMS.txt
+      - name: Create release
+        run: |
+          set -euo pipefail
+          mapfile -t assets < out/assets.txt
+          [ "${#assets[@]}" -gt 0 ] || { echo "assets.txt is empty"; exit 1; }
+          files=()
+          for a in "${assets[@]}"; do files+=("out/$a"); done
+          files+=("out/SHA256SUMS.txt")
+          title="${TITLE_PREFIX:+${TITLE_PREFIX} ${VERSION}}"
+          title="${title:-$TAG}"
+          args=(release create "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$title")
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          if [ -n "$NOTES_DIR" ]; then
+            args+=(--notes-file "$NOTES_DIR/$VERSION.md")
+          else
+            args+=(--notes "Build ${GITHUB_SHA::8}. Notes follow.")
+          fi
+          gh "${args[@]}"
+      - name: Keep newest releases
+        if: inputs.keep-releases > 0
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq 'map(select(.tagName | test("^((alpha|beta)-|v[0-9])"))) | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' |
+          while read -r old; do
+            [ -n "$old" ] && gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
+
+  would-publish:
+    needs: [check-tag, gate-windows, build-windows]
+    if: >-
+      always() && needs.build-windows.result == 'success'
+      && contains(fromJSON('["success","skipped"]'), needs.gate-windows.result)
+      && inputs.dry-run
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    steps:
+      - run: echo "would publish $TAG"

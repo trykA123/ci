@@ -1,0 +1,138 @@
+# Reusable Linux gate for trykA123 Rust workspaces: fmt, clippy, supply-chain checks, tests and doc-tests.
+name: rust-linux-gate
+
+on:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: "Rust toolchain version (empty reads rust-toolchain.toml or defaults to 1.99.0)"
+        required: false
+        type: string
+        default: ""
+      linux-deps:
+        description: "Install GPUI/desktop system libraries on ubuntu-latest"
+        required: false
+        type: boolean
+        default: true
+      use-xtask-gate:
+        description: "Run `cargo xtask gate` instead of standard Cargo steps"
+        required: false
+        type: boolean
+        default: false
+      coverage:
+        description: "Pass `--coverage` to `cargo xtask gate` (requires use-xtask-gate)"
+        required: false
+        type: boolean
+        default: false
+      run-audit:
+        description: "Run `cargo audit`"
+        required: false
+        type: boolean
+        default: true
+      nextest-version:
+        description: "Pinned cargo-nextest version"
+        required: false
+        type: string
+        default: "0.9.148"
+      cache-key:
+        description: "Shared rust-cache key"
+        required: false
+        type: string
+        default: "linux-gate"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gate-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Rust toolchain version
+        id: tc
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+          components: ${{ inputs.coverage && 'rustfmt, clippy, llvm-tools' || 'rustfmt, clippy' }}
+
+      - name: Install Linux desktop libraries
+        if: inputs.linux-deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev \
+            libasound2-dev libzstd-dev
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ${{ inputs.cache-key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compute tool list
+        id: tools
+        env:
+          NEXTEST_VER: ${{ inputs.nextest-version }}
+          USE_XTASK: ${{ inputs.use-xtask-gate }}
+          WITH_COV: ${{ inputs.coverage }}
+          RUN_AUDIT: ${{ inputs.run-audit }}
+        run: |
+          set -euo pipefail
+          tools=("cargo-nextest@${NEXTEST_VER}")
+          if [ "$WITH_COV" = "true" ]; then tools+=("cargo-llvm-cov@0.9.1"); fi
+          if [ "$USE_XTASK" = "true" ] || [ -f deny.toml ]; then tools+=("cargo-deny@0.20.2"); fi
+          if [ "$USE_XTASK" = "true" ] || [ "$RUN_AUDIT" = "true" ]; then tools+=("cargo-audit@0.22.2"); fi
+          if [ "$USE_XTASK" = "true" ] || [ -f typos.toml ]; then tools+=("typos@1.51.1"); fi
+          if [ "$USE_XTASK" = "true" ] || [ -f taplo.toml ]; then tools+=("taplo@0.10.0"); fi
+          IFS=,; echo "list=${tools[*]}" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: ${{ steps.tools.outputs.list }}
+
+      - name: Run xtask gate
+        if: inputs.use-xtask-gate
+        run: ${{ inputs.coverage && 'cargo xtask gate --coverage' || 'cargo xtask gate' }}
+
+      - name: Run standard Rust gate
+        if: ${{ !inputs.use-xtask-gate }}
+        env:
+          RUN_AUDIT: ${{ inputs.run-audit }}
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          if [ -f taplo.toml ]; then taplo check; fi
+          if [ -f typos.toml ]; then typos; fi
+          if [ -f deny.toml ]; then cargo deny check; fi
+          if [ "$RUN_AUDIT" = "true" ]; then cargo audit; fi
+          if [ -f .config/nextest.toml ]; then
+            cargo nextest run --workspace --profile ci
+          else
+            cargo nextest run --workspace --no-fail-fast
+          fi
+          cargo test --workspace --doc
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: junit-linux
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore

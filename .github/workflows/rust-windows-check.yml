@@ -1,0 +1,396 @@
+# Reusable Windows check pipeline: parallel clippy + build-once nextest archive + N test shards, with targeted package mode.
+name: rust-windows-check
+
+on:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: "Rust toolchain version (empty reads rust-toolchain.toml or defaults to 1.99.0)"
+        required: false
+        type: string
+        default: ""
+      packages:
+        description: "Space-separated crate names for targeted runs on feature/ci branches (forbidden on main)"
+        required: false
+        type: string
+        default: ""
+      shards:
+        description: "Number of parallel Windows test shards for full-workspace runs (1 runs inline without archiving)"
+        required: false
+        type: number
+        default: 4
+      nextest-version:
+        description: "Pinned cargo-nextest version"
+        required: false
+        type: string
+        default: "0.9.148"
+      use-lld:
+        description: "Use toolchain-bundled rust-lld (invoked as lld-link) instead of link.exe"
+        required: false
+        type: boolean
+        default: true
+      dev-debug:
+        description: "Optional CARGO_PROFILE_DEV_DEBUG / TEST_DEBUG override (e.g. line-tables-only for apps without [profile.dev] in Cargo.toml)"
+        required: false
+        type: string
+        default: ""
+      pre-archive-cmd:
+        description: "Optional PowerShell command run in the build job before archiving (e.g. fetching pdfium.dll)"
+        required: false
+        type: string
+        default: ""
+      build-host-tests-expr:
+        description: "Optional nextest filter expression for tests that must run on the build runner (e.g. rustc/rlib tests)"
+        required: false
+        type: string
+        default: ""
+      extra-env-json:
+        description: "Optional JSON object of extra environment variables exported in build and test jobs"
+        required: false
+        type: string
+        default: "{}"
+      build-release-pkg:
+        description: "Optional package to build with --release in parallel and upload as a preview artifact"
+        required: false
+        type: string
+        default: ""
+      release-artifact-path:
+        description: "Path of the preview artifact when build-release-pkg is set"
+        required: false
+        type: string
+        default: ""
+      artifact-retention-days:
+        description: "Retention days for preview artifacts"
+        required: false
+        type: number
+        default: 14
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  clippy:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      INPUT_PACKAGES: ${{ inputs.packages }}
+    steps:
+      - name: Reject targeted runs on main
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -eq 'refs/heads/main' -and -not [string]::IsNullOrWhiteSpace($env:INPUT_PACKAGES)) {
+            throw 'Targeted package runs are forbidden on main; run the full workspace.'
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Rust toolchain version
+        id: tc
+        shell: bash
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: win-clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run clippy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = [Collections.Generic.List[string]]::new()
+          $args.Add('clippy')
+          $pkgs = ($env:INPUT_PACKAGES -split '\s+' | Where-Object { $_ })
+          if ($pkgs.Count -gt 0) {
+            foreach ($p in $pkgs) {
+              if ($p -notmatch '^[A-Za-z0-9_-]+$') { throw "invalid package name: $p" }
+              $args.Add('-p')
+              $args.Add($p)
+            }
+          } else {
+            $args.Add('--workspace')
+          }
+          $args.AddRange([string[]]@('--all-targets', '--', '-D', 'warnings'))
+          & cargo @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+      run_shards: ${{ steps.plan.outputs.run_shards }}
+    env:
+      INPUT_PACKAGES: ${{ inputs.packages || '' }}
+      INPUT_SHARDS: ${{ inputs.shards || 4 }}
+      EXTRA_ENV_JSON: ${{ inputs.extra-env-json }}
+      PRE_ARCHIVE_CMD: ${{ inputs.pre-archive-cmd }}
+      BUILD_HOST_EXPR: ${{ inputs.build-host-tests-expr }}
+    steps:
+      - name: Plan shard count and validate main invariant
+        id: plan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkgs = @($env:INPUT_PACKAGES -split '\s+' | Where-Object { $_ })
+          if ($env:GITHUB_REF -eq 'refs/heads/main' -and $pkgs.Count -gt 0) {
+            throw 'Targeted package runs are forbidden on main; run the full workspace.'
+          }
+          foreach ($p in $pkgs) {
+            if ($p -notmatch '^[A-Za-z0-9_-]+$') { throw "invalid package name: $p" }
+          }
+          $requested = [int]$env:INPUT_SHARDS
+          if ($requested -lt 1 -or $requested -gt 8) { throw "shards must be 1..8, got $requested" }
+          $useShards = ($pkgs.Count -eq 0 -and $requested -gt 1)
+          if ($useShards) {
+            $list = (1..$requested) -join ','
+            "shards=[$list]" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "shard_count=$requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'run_shards=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            'shards=[]' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'shard_count=0' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'run_shards=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Export extra environment variables
+        shell: pwsh
+        env:
+          DEV_DEBUG: ${{ inputs.dev-debug }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:DEV_DEBUG)) {
+            "CARGO_PROFILE_DEV_DEBUG=$env:DEV_DEBUG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "CARGO_PROFILE_TEST_DEBUG=$env:DEV_DEBUG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          $map = $env:EXTRA_ENV_JSON | ConvertFrom-Json
+          foreach ($prop in $map.PSObject.Properties) {
+            "$($prop.Name)=$($prop.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Resolve Rust toolchain version
+        id: tc
+        shell: bash
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+
+      - name: Enable bundled rust-lld as lld-link
+        if: inputs.use-lld
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sysroot = (rustc --print sysroot).Trim()
+          $rustLld = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'rust-lld-bin'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item -LiteralPath $rustLld -Destination (Join-Path $dir 'lld-link.exe') -Force
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link'
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: win-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest@${{ inputs.nextest-version }}
+
+      - name: Run pre-archive command
+        if: inputs.pre-archive-cmd != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $global:LASTEXITCODE = 0
+          Invoke-Expression $env:PRE_ARCHIVE_CMD
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build test archive (sharded full-workspace mode)
+        if: steps.plan.outputs.run_shards == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $profileArgs = if (Test-Path -LiteralPath '.config/nextest.toml') { @('--profile', 'ci') } else { @() }
+          & cargo nextest archive --workspace @profileArgs --archive-file nextest-archive.tar.zst
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not [string]::IsNullOrWhiteSpace($env:BUILD_HOST_EXPR)) {
+            & cargo nextest run --workspace @profileArgs -E $env:BUILD_HOST_EXPR
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Run tests inline (targeted or single-shard mode)
+        if: steps.plan.outputs.run_shards != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = [Collections.Generic.List[string]]::new()
+          $args.AddRange([string[]]@('nextest', 'run'))
+          $pkgs = @($env:INPUT_PACKAGES -split '\s+' | Where-Object { $_ })
+          if ($pkgs.Count -gt 0) {
+            foreach ($p in $pkgs) { $args.Add('-p'); $args.Add($p) }
+          } else {
+            $args.Add('--workspace')
+          }
+          if (Test-Path -LiteralPath '.config/nextest.toml') {
+            $args.AddRange([string[]]@('--profile', 'ci'))
+          } else {
+            $args.Add('--no-fail-fast')
+          }
+          & cargo @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.plan.outputs.run_shards == 'true'
+        with:
+          name: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: junit-windows-build
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test:
+    needs: build
+    if: needs.build.outputs.run_shards == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    env:
+      EXTRA_ENV_JSON: ${{ inputs.extra-env-json }}
+      BUILD_HOST_EXPR: ${{ inputs.build-host-tests-expr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Export extra environment variables
+        shell: pwsh
+        env:
+          DEV_DEBUG: ${{ inputs.dev-debug }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:DEV_DEBUG)) {
+            "CARGO_PROFILE_DEV_DEBUG=$env:DEV_DEBUG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "CARGO_PROFILE_TEST_DEBUG=$env:DEV_DEBUG" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          $map = $env:EXTRA_ENV_JSON | ConvertFrom-Json
+          foreach ($prop in $map.PSObject.Properties) {
+            "$($prop.Name)=$($prop.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest@${{ inputs.nextest-version }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .
+
+      - name: Run shard ${{ matrix.shard }} of ${{ needs.build.outputs.shard_count }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = [Collections.Generic.List[string]]::new()
+          $args.AddRange([string[]]@(
+            'nextest', 'run',
+            '--archive-file', 'nextest-archive.tar.zst',
+            '--extract-to', '.',
+            '--extract-overwrite',
+            '--workspace-remap', '.',
+            '--partition', "hash:${{ matrix.shard }}/${{ needs.build.outputs.shard_count }}"
+          ))
+          if (Test-Path -LiteralPath '.config/nextest.toml') {
+            $args.AddRange([string[]]@('--profile', 'ci'))
+          } else {
+            $args.Add('--no-fail-fast')
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:BUILD_HOST_EXPR)) {
+            $args.Add('-E')
+            $args.Add("not ($env:BUILD_HOST_EXPR)")
+          }
+          & cargo @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: junit-windows-shard-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  build-preview:
+    if: inputs.build-release-pkg != ''
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PKG: ${{ inputs.build-release-pkg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve Rust toolchain version
+        id: tc
+        shell: bash
+        env:
+          INPUT_TC: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          tc="$INPUT_TC"
+          if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+            tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          fi
+          echo "version=${tc:-1.99.0}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+        with:
+          toolchain: ${{ steps.tc.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: win-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - shell: pwsh
+        run: |
+          cargo build --release -p $env:PKG
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.build-release-pkg }}-${{ github.sha }}
+          path: ${{ inputs.release-artifact-path }}
+          retention-days: ${{ inputs.artifact-retention-days }}

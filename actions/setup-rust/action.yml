@@ -1,0 +1,103 @@
+# Shared Rust setup: toolchain, optional Linux GUI deps, optional Windows rust-lld, cache, and prebuilt tools.
+name: Setup Rust
+description: Install Rust toolchain, configure CI cargo flags, restore shared rust-cache, and install prebuilt cargo tools.
+
+inputs:
+  toolchain:
+    description: "Rust toolchain version (empty reads rust-toolchain.toml or falls back to 1.99.0)"
+    required: false
+    default: ""
+  components:
+    description: "Comma-separated rustup components, e.g. clippy or rustfmt, clippy, llvm-tools"
+    required: false
+    default: ""
+  cache-key:
+    description: "Swatinem/rust-cache shared-key so jobs and workflows share one warm cache"
+    required: true
+  save-cache:
+    description: "Cache save policy: auto (save on refs/heads/main only), true, or false"
+    required: false
+    default: "auto"
+  cache-on-failure:
+    description: "Save cache even when the job fails"
+    required: false
+    default: "false"
+  tools:
+    description: "Comma-separated prebuilt tools for taiki-e/install-action (e.g. cargo-nextest@0.9.148)"
+    required: false
+    default: ""
+  use-lld:
+    description: "On Windows, use the toolchain's bundled rust-lld (invoked as lld-link) instead of link.exe"
+    required: false
+    default: "false"
+  linux-deps:
+    description: "On Linux, install GPUI/desktop system libraries (X11, Wayland, Vulkan, ALSA, zstd)"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Rust toolchain version
+      id: tc
+      shell: bash
+      env:
+        INPUT_TC: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+        tc="$INPUT_TC"
+        if [ -z "$tc" ] && [ -f rust-toolchain.toml ]; then
+          tc=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+        fi
+        tc="${tc:-1.99.0}"
+        echo "version=$tc" >> "$GITHUB_OUTPUT"
+
+    - name: Export CI Cargo environment
+      shell: bash
+      run: |
+        {
+          echo "CARGO_TERM_COLOR=always"
+          echo "CARGO_INCREMENTAL=0"
+        } >> "$GITHUB_ENV"
+
+    - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
+      with:
+        toolchain: ${{ steps.tc.outputs.version }}
+        components: ${{ inputs.components }}
+
+    - name: Enable bundled rust-lld as lld-link on Windows
+      if: runner.os == 'Windows' && inputs.use-lld == 'true'
+      shell: pwsh
+      run: |
+        $sysroot = (rustc --print sysroot).Trim()
+        $rustLld = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
+        if (-not (Test-Path -LiteralPath $rustLld)) {
+          throw "bundled rust-lld.exe not found at $rustLld"
+        }
+        $dir = Join-Path $env:RUNNER_TEMP 'rust-lld-bin'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Copy-Item -LiteralPath $rustLld -Destination (Join-Path $dir 'lld-link.exe') -Force
+        Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link'
+
+    - name: Install Linux desktop libraries
+      if: runner.os == 'Linux' && inputs.linux-deps == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+          libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev \
+          libasound2-dev libzstd-dev
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache == 'true' || (inputs.save-cache == 'auto' && github.ref == 'refs/heads/main') }}
+        cache-on-failure: ${{ inputs.cache-on-failure }}
+
+    - name: Install prebuilt cargo tools
+      if: inputs.tools != ''
+      uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      with:
+        tool: ${{ inputs.tools }}
