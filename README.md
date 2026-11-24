@@ -71,3 +71,7 @@ jobs:
 - All third-party actions pinned to full 40-char commit SHAs.
 - Least-privilege `permissions:` per job (`contents: read` by default; `id-token: write` + `attestations: write` only on release build; `contents: write` only on `publish`).
 - Automatic `cargo deny check` whenever `deny.toml` is present, plus `cargo auditable` + `cargo audit bin` on release executables.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
